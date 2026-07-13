@@ -1,0 +1,12 @@
+# Netlify publish settings — repo root is the static site
+[build]
+  publish = "."
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+    Content-Security-Policy = "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net 'sha256-Te5+vGZEsGinks37ph94S9wuySfP8X6/cIw8oICOWG8=' 'sha256-ptt3lyplRzlARRkud8WyZ4duskuzlzZ1VGGwhYucyXs=' 'sha256-+48AqjRXrjVjOriYRundL5hruWYMqv5cYIadRIaSoMA='; style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://cdn.jsdelivr.net https://photon.komoot.io https://nominatim.openstreetmap.org; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
