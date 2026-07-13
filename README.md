@@ -37,4 +37,4 @@ A local server is required so geocoding and map data fetches work correctly.
 
 ## Live site
 
-https://YOUR-SITE-NAME.netlify.app
+[https://meridianzones.netlify.app](https://meridianzones.netlify.app)
