@@ -130,6 +130,9 @@ function extractCountryHint(query){
   return null;
 }
 
+const SETTLEMENT_OSM_VALUES = new Set(['city','town','village','hamlet','municipality','borough','suburb']);
+const POI_OSM_VALUES = new Set(['footway','track','path','cycleway','pedestrian','steps','bridleway','service']);
+
 /* City-like tokens at the end of an address fragment (after stripping street suffixes). */
 function trailingCityPhrase(text){
   const tokens = text.replace(/^\s*\d+\s*/, '').split(/[\s,]+/).filter(Boolean);
@@ -143,34 +146,155 @@ function trailingCityPhrase(text){
   return kept.join(' ');
 }
 
+/* Strip a leading house number and return {houseNumber, rest}. */
+function splitHouseNumber(query){
+  const m = query.trim().match(/^(\d+[A-Za-z]?)\s+(.+)$/);
+  if(!m) return {houseNumber: null, rest: query.trim()};
+  return {houseNumber: m[1], rest: m[2].trim()};
+}
+
+/* Parse US-style address pieces: house number, street, city, state. */
+function parseAddressComponents(query){
+  const stateHint = extractStateHint(query);
+  const stateName = stateHint ? US_STATE_ABBR[stateHint] : null;
+  const countryCode = extractCountryHint(query) || (stateHint ? 'US' : null);
+  const {houseNumber, rest} = splitHouseNumber(query);
+  let city = null, street = null;
+
+  if(stateHint){
+    const commaParts = rest.split(',').map(s => s.trim()).filter(Boolean);
+    if(commaParts.length >= 2 && extractStateHint(commaParts[commaParts.length - 1]) === stateHint){
+      const cityPart = commaParts[commaParts.length - 2];
+      city = trailingCityPhrase(cityPart);
+      if(city){
+        const cityRe = new RegExp('\\b' + city.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i');
+        street = cityPart.replace(cityRe, '').trim().replace(/^\d+\s*/, '').trim() || null;
+      }
+    }else{
+      const stateFull = stateName.toLowerCase();
+      const lq = rest.toLowerCase();
+      let idx = lq.lastIndexOf(stateFull);
+      if(idx < 0){
+        const re = new RegExp('(?:^|[\\s,])' + stateFull.replace(/ /g, '[\\s,]+') + '(?:[\\s,]|$)');
+        const m = lq.match(re);
+        if(m) idx = m.index;
+      }
+      if(idx >= 0){
+        const before = rest.slice(0, idx).trim().replace(/[,\s]+$/, '');
+        city = trailingCityPhrase(before);
+        if(city){
+          const cityRe = new RegExp('\\b' + city.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i');
+          street = before.replace(cityRe, '').trim().replace(/^\d+\s*/, '').trim() || null;
+        }
+      }
+    }
+  }
+
+  return {houseNumber, street, city, stateHint, stateName, countryCode};
+}
+
+function looksLikeStreetAddress(components){
+  if(!components) return false;
+  if(components.houseNumber) return true;
+  if(components.street && components.stateHint) return true;
+  return false;
+}
+
+function looksLikePoiQuery(query, components){
+  const lq = query.toLowerCase();
+  if(components && components.houseNumber) return false;
+  if(!/\b(trail|falls|path|track)\b/.test(lq)) return false;
+  // Explicit trail/POI wording without a house-number address pattern.
+  return !looksLikeStreetAddress(components);
+}
+
+function stateMatchesResult(components, result){
+  if(!components.stateHint) return true;
+  const target = components.stateName.toLowerCase();
+  const fields = [result.state, result.admin, result.label, result.countryName].filter(Boolean).map(s => String(s).toLowerCase());
+  if(components.stateHint.length === 2){
+    return fields.some(f => f.includes(target) || f.includes(components.stateHint.toLowerCase()));
+  }
+  return fields.some(f => f.includes(target));
+}
+
+function isSettlementResult(result){
+  const val = (result.osmValue || result.placeType || result.addresstype || '').toLowerCase();
+  if(SETTLEMENT_OSM_VALUES.has(val)) return true;
+  if(result.osmClass === 'place') return true;
+  if(result.osmType === 'administrative' && (result.addresstype === 'city' || result.addresstype === 'town' || result.addresstype === 'village')) return true;
+  return false;
+}
+
+function isPoiResult(result){
+  const val = (result.osmValue || result.placeType || '').toLowerCase();
+  if(POI_OSM_VALUES.has(val)) return true;
+  if(result.osmKey === 'highway') return true;
+  if(/\btrail\b/i.test(result.label || '')) return true;
+  return false;
+}
+
+function cityMatchesResult(components, result){
+  if(!components.city) return false;
+  const cityLc = components.city.toLowerCase();
+  const names = [result.shortName, result.city, result.label].filter(Boolean).map(s => String(s).toLowerCase());
+  return names.some(n => n === cityLc || n.startsWith(cityLc + ',') || n.includes(', ' + cityLc + ','));
+}
+
+function formatSettlementPlaceLabel(result, components){
+  const parts = dedupe([result.shortName || result.city, components.stateName, result.countryName || 'United States']).filter(Boolean);
+  return parts.join(', ');
+}
+
+function applyHonestTownLabel(result, components, usedStructuredFallback){
+  if(!components || !looksLikeStreetAddress(components)) return result;
+  if(result.streetLevel) return result;
+  if(!isSettlementResult(result)) return result;
+  if(!cityMatchesResult(components, result) && !usedStructuredFallback) return result;
+  const place = formatSettlementPlaceLabel(result, components);
+  return {...result, label: fillTemplate('geoTownNotStreet', {place})};
+}
+
+function rankGeocodeResults(results, query, components){
+  const addressLike = looksLikeStreetAddress(components);
+  const poiIntent = looksLikePoiQuery(query, components);
+  return results.slice().sort((a, b)=>{
+    const score = r => {
+      let s = 0;
+      if(r.streetLevel) s += 200;
+      if(addressLike && components.city && cityMatchesResult(components, r) && stateMatchesResult(components, r)) s += 120;
+      if(addressLike && isSettlementResult(r) && stateMatchesResult(components, r)) s += 80;
+      if(poiIntent && isPoiResult(r)) s += 90;
+      if(addressLike && isPoiResult(r)) s -= 60;
+      if(isSettlementResult(r)) s += 20;
+      if(r._structured) s += 15;
+      return s;
+    };
+    return score(b) - score(a);
+  });
+}
+
+function dedupeGeocodeResults(results){
+  const seen = new Set();
+  return results.filter(r=>{
+    const key = [r.lat && r.lat.toFixed(3), r.lon && r.lon.toFixed(3), r.shortName, r.label].join('|');
+    if(seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 /* Best city-name candidate from the part of the query that precedes a US state name. */
 function extractCityBeforeState(query){
-  const stateHint = extractStateHint(query);
-  if(!stateHint) return null;
-  const stateFull = US_STATE_ABBR[stateHint];
-  const lq = query.toLowerCase();
-  let idx = lq.lastIndexOf(stateFull.toLowerCase());
-  if(idx < 0){
-    const re = new RegExp('(?:^|[\\s,])' + stateFull.toLowerCase().replace(/ /g, '[\\s,]+') + '(?:[\\s,]|$)');
-    const m = lq.match(re);
-    if(m) idx = m.index;
-  }
-  if(idx < 0) return null;
-  const before = query.slice(0, idx).trim().replace(/[,\s]+$/, '');
-  if(!before) return null;
-  const phrase = trailingCityPhrase(before);
-  return phrase.length >= 3 ? phrase : null;
+  const parsed = parseAddressComponents(query);
+  return parsed.city || null;
 }
 
 function buildOnlineRelaxedQuery(query){
-  const stateHint = extractStateHint(query);
-  const countryCode = extractCountryHint(query);
-  if(stateHint){
-    const stateName = US_STATE_ABBR[stateHint];
-    const city = extractCityBeforeState(query) || trailingCityPhrase(query) || extractCityCandidates(query).find(c => c.length >= 3);
-    if(city) return city + ', ' + stateName;
-    return stateName;
-  }
+  const parsed = parseAddressComponents(query);
+  if(parsed.city && parsed.stateName) return parsed.city + ', ' + parsed.stateName;
+  if(parsed.stateName) return parsed.stateName;
+  const countryCode = parsed.countryCode;
   if(countryCode){
     const countryName = COUNTRY_NAMES[countryCode] || countryCode;
     const city = extractCityCandidates(query).find(c => c.length >= 3);
@@ -178,6 +302,50 @@ function buildOnlineRelaxedQuery(query){
   }
   const candidates = extractCityCandidates(query).filter(c => c.length >= 3);
   return candidates.length ? candidates[0] : null;
+}
+
+function mapPhotonFeature(f, query){
+  const p = f.properties || {};
+  const parts = dedupe([p.name, p.street, p.city, p.state, p.country]);
+  return {
+    lat: f.geometry.coordinates[1],
+    lon: f.geometry.coordinates[0],
+    label: parts.join(', ') || query,
+    shortName: p.name || p.city || p.state || p.country || query,
+    countryName: p.country || '',
+    city: p.city || '',
+    state: p.state || '',
+    street: p.street || '',
+    osmKey: p.osm_key || '',
+    osmValue: p.osm_value || '',
+    placeType: p.type || '',
+    streetLevel: !!(p.housenumber || p.street),
+    _provider: 'photon'
+  };
+}
+
+function mapNominatimResult(d){
+  const addr = d.address || {};
+  const city = addr.city || addr.town || addr.village || addr.hamlet || '';
+  const state = addr.state || '';
+  return {
+    lat: parseFloat(d.lat),
+    lon: parseFloat(d.lon),
+    label: d.display_name,
+    shortName: city || state || d.display_name.split(',')[0],
+    countryName: addr.country || '',
+    city,
+    state,
+    street: addr.road || addr.pedestrian || addr.footway || '',
+    osmClass: d.class || '',
+    osmType: d.type || '',
+    category: d.category || '',
+    addresstype: d.addresstype || '',
+    osmValue: d.addresstype || d.type || '',
+    placeType: d.addresstype || d.type || '',
+    streetLevel: !!(addr.house_number || d.addresstype === 'house' || d.class === 'building' || d.class === 'place' && d.type === 'house'),
+    _provider: 'nominatim'
+  };
 }
 
 function formatLocalLabel(name, cc, admin, countryName){
@@ -259,17 +427,7 @@ async function fetchPhoton(query, limit){
     }
     const data = await res.json();
     if(data && Array.isArray(data.features) && data.features.length){
-      return {results: data.features.map(f=>{
-        const p = f.properties || {};
-        const parts = dedupe([p.name, p.street, p.city, p.state, p.country]);
-        return {
-          lat: f.geometry.coordinates[1],
-          lon: f.geometry.coordinates[0],
-          label: parts.join(', ') || query,
-          shortName: p.name || p.city || p.state || p.country || query,
-          countryName: p.country || ''
-        };
-      })};
+      return {results: data.features.map(f => mapPhotonFeature(f, query))};
     }
     return {results: [], reason: null, status: res.status};
   }catch(e){
@@ -298,12 +456,7 @@ async function fetchNominatim(query, limit){
     }
     const data = await res.json();
     if(data && data.length){
-      return {results: data.map(d=>({
-        lat: parseFloat(d.lat), lon: parseFloat(d.lon),
-        label: d.display_name,
-        shortName: (d.address && (d.address.city || d.address.town || d.address.village || d.address.state || d.address.country)) || d.display_name.split(',')[0],
-        countryName: (d.address && d.address.country) || ''
-      }))};
+      return {results: data.map(mapNominatimResult)};
     }
     return {results: [], reason: null, status: res.status};
   }catch(e){
@@ -312,35 +465,133 @@ async function fetchNominatim(query, limit){
   }
 }
 
+async function fetchNominatimStructured(components, limit){
+  if(!components.city || !components.stateName) return {results: []};
+  const params = new URLSearchParams({
+    format: 'jsonv2',
+    addressdetails: '1',
+    limit: String(limit),
+    city: components.city,
+    state: components.stateName,
+    countrycodes: 'us'
+  });
+  if(components.street) params.set('street', components.street);
+  if(components.houseNumber) params.set('housenumber', components.houseNumber);
+  const url = 'https://nominatim.openstreetmap.org/search?' + params.toString();
+  geoLog('nominatim structured request', url);
+  try{
+    const ctrl = new AbortController();
+    const timer = setTimeout(()=> ctrl.abort(), GEOCODE_TIMEOUT_MS);
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': GEOCODE_USER_AGENT
+      }
+    });
+    clearTimeout(timer);
+    geoLog('nominatim structured response', {status: res.status, ok: res.ok});
+    if(!res.ok){
+      return {results: null, reason: classifyProviderError(null, res.status), status: res.status};
+    }
+    const data = await res.json();
+    if(data && data.length){
+      return {results: data.map(d => ({...mapNominatimResult(d), _structured: true}))};
+    }
+    return {results: [], reason: null, status: res.status};
+  }catch(e){
+    geoLog('nominatim structured error', e.message || e);
+    return {results: null, reason: classifyProviderError(e), error: e};
+  }
+}
+
+async function fetchPhotonCityState(components, limit){
+  if(!components.city || !components.stateName) return {results: []};
+  const q = components.city + ', ' + components.stateName;
+  const resp = await fetchPhoton(q, Math.max(limit * 2, 12));
+  if(!resp.results) return resp;
+  const ranked = rankGeocodeResults(resp.results, q, components);
+  return {results: ranked.slice(0, limit), reason: resp.reason, status: resp.status, error: resp.error};
+}
+
+function finalizeOnlineResults(results, query, components, meta){
+  const usedStructuredFallback = !!meta.structuredFallback;
+  const ranked = rankGeocodeResults(dedupeGeocodeResults(results), query, components);
+  const labeled = ranked.map(r => applyHonestTownLabel(r, components, usedStructuredFallback));
+  return wrapResultList(labeled.slice(0, meta.limit), {__meta: meta.__meta});
+}
+
+function hasStreetLevelMatch(results){
+  return results.some(r => r.streetLevel);
+}
+
+function hasSettlementMatch(results, components){
+  return results.some(r => isSettlementResult(r) && stateMatchesResult(components, r) &&
+    (!components.city || cityMatchesResult(components, r)));
+}
+
 async function geocodeOnline(query, limit){
   const attempts = [];
+  const components = parseAddressComponents(query);
   function note(provider, outcome){ attempts.push({provider, ...outcome}); }
 
+  let merged = [];
   let photon = await fetchPhoton(query, limit);
   note('photon', {query, count: photon.results ? photon.results.length : null, reason: photon.reason, status: photon.status});
-  if(photon.results && photon.results.length){
-    return wrapResultList(photon.results, {__meta: {source: 'online', provider: 'photon', attempts}});
-  }
+  if(photon.results && photon.results.length) merged = merged.concat(photon.results);
 
   let nominatim = await fetchNominatim(query, limit);
   note('nominatim', {query, count: nominatim.results ? nominatim.results.length : null, reason: nominatim.reason, status: nominatim.status});
-  if(nominatim.results && nominatim.results.length){
-    return wrapResultList(nominatim.results, {__meta: {source: 'online', provider: 'nominatim', attempts}});
+  if(nominatim.results && nominatim.results.length) merged = merged.concat(nominatim.results);
+
+  const needsStructured = components.city && components.stateHint && (
+    !merged.length || (looksLikeStreetAddress(components) && !hasStreetLevelMatch(merged) && !hasSettlementMatch(merged, components))
+  );
+
+  let structuredFallback = false;
+  if(needsStructured){
+    geoLog('structured fallback', components);
+    if(components.street || components.houseNumber){
+      const streetTry = await fetchNominatimStructured(components, limit);
+      note('nominatim-structured-street', {count: streetTry.results ? streetTry.results.length : null, reason: streetTry.reason, status: streetTry.status});
+      if(streetTry.results && streetTry.results.length){
+        merged = merged.concat(streetTry.results);
+        if(hasStreetLevelMatch(streetTry.results)){
+          return finalizeOnlineResults(merged, query, components, {
+            limit, structuredFallback: true,
+            __meta: {source: 'online', provider: 'nominatim-structured', attempts}
+          });
+        }
+      }
+    }
+
+    const cityStreet = {...components, street: null, houseNumber: null};
+    const structNom = await fetchNominatimStructured(cityStreet, limit);
+    note('nominatim-structured-city', {count: structNom.results ? structNom.results.length : null, reason: structNom.reason, status: structNom.status});
+    if(structNom.results && structNom.results.length) merged = merged.concat(structNom.results);
+
+    const structPhoton = await fetchPhotonCityState(components, limit);
+    note('photon-structured-city', {count: structPhoton.results ? structPhoton.results.length : null, reason: structPhoton.reason, status: structPhoton.status});
+    if(structPhoton.results && structPhoton.results.length) merged = merged.concat(structPhoton.results);
+    structuredFallback = true;
+  }else{
+    const relaxed = buildOnlineRelaxedQuery(query);
+    if(relaxed && relaxed.toLowerCase() !== query.trim().toLowerCase() && !merged.length){
+      geoLog('relaxed online query', relaxed);
+      photon = await fetchPhoton(relaxed, limit);
+      note('photon-relaxed', {query: relaxed, count: photon.results ? photon.results.length : null, reason: photon.reason, status: photon.status});
+      if(photon.results && photon.results.length) merged = merged.concat(photon.results);
+      nominatim = await fetchNominatim(relaxed, limit);
+      note('nominatim-relaxed', {query: relaxed, count: nominatim.results ? nominatim.results.length : null, reason: nominatim.reason, status: nominatim.status});
+      if(nominatim.results && nominatim.results.length) merged = merged.concat(nominatim.results);
+    }
   }
 
-  const relaxed = buildOnlineRelaxedQuery(query);
-  if(relaxed && relaxed.toLowerCase() !== query.trim().toLowerCase()){
-    geoLog('relaxed online query', relaxed);
-    photon = await fetchPhoton(relaxed, limit);
-    note('photon-relaxed', {query: relaxed, count: photon.results ? photon.results.length : null, reason: photon.reason, status: photon.status});
-    if(photon.results && photon.results.length){
-      return wrapResultList(photon.results, {__meta: {source: 'online', provider: 'photon', relaxed: true, attempts}});
-    }
-    nominatim = await fetchNominatim(relaxed, limit);
-    note('nominatim-relaxed', {query: relaxed, count: nominatim.results ? nominatim.results.length : null, reason: nominatim.reason, status: nominatim.status});
-    if(nominatim.results && nominatim.results.length){
-      return wrapResultList(nominatim.results, {__meta: {source: 'online', provider: 'nominatim', relaxed: true, attempts}});
-    }
+  if(merged.length){
+    return finalizeOnlineResults(merged, query, components, {
+      limit, structuredFallback,
+      __meta: {source: 'online', provider: structuredFallback ? 'structured' : 'free-text', attempts}
+    });
   }
 
   const reasons = [photon.reason, nominatim.reason].filter(Boolean);
@@ -437,7 +688,8 @@ function localSearchWithFallback(query, limit){
 
   if(stateHint){
     const region = US_STATE_ABBR[stateHint];
-    const term = extractCityBeforeState(query) || trailingCityPhrase(query) || extractCityCandidates(query).find(c => c.length >= 3) || query.trim();
+    const parsed = parseAddressComponents(query);
+    const term = parsed.city || trailingCityPhrase(query) || extractCityCandidates(query).find(c => c.length >= 3) || query.trim();
     const fallback = topCitiesInState(stateHint, limit);
     if(fallback.length){
       fallback.banner = fillTemplate('offlineNoMatchInState', {term, region});

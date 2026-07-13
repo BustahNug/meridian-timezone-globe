@@ -43,6 +43,7 @@ en: {
   geoHintServiceUnavailable: "Address lookup unavailable right now — showing built-in city matches",
   geoHintRateLimited: "Search service busy — try again in a minute",
   offlineNoMatchInState: "No match for '{term}' in {region} offline — largest {region} cities:",
+  geoTownNotStreet: "{place} (street address not found in map data — showing town)",
   bar12am: "12am", bar6am: "6am", bar12pm: "12pm", bar6pm: "6pm"
 },
 es: {
